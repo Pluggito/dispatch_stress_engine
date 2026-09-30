@@ -1,0 +1,25 @@
+import type { Coordinates } from "./types";
+
+export const faculty = {
+  "unilag faculty of education": { lat: 6.5168128, lng: 3.3855799 },
+  "Dli": { lat: 6.511937, lng: 3.3921141 },
+  "ISL": { lat: 6.5119596, lng: 3.3917768 },
+  "unilag faculty of education library": { lat: 6.5165428, lng: 3.3860369 },
+  "Diploma building": { lat: 6.5164633, lng: 3.3848606 },
+  "unilag faculty of environmental sciences": { lat: 6.5175129, lng: 3.3872866 },
+  "unilag sport centre": { lat: 6.5172387, lng: 3.3885917 },
+  "CITS": { lat: 6.5183683, lng: 3.3951269 },
+  "unilag faculty of mass communication": { lat: 6.5185502, lng: 3.3966009 },
+  "unilag faculty of arts": { lat: 6.5194676, lng: 3.3980338 },
+  "unilag faculty of law": { lat: 6.5201184, lng: 3.3989569 },
+  "senate building": { lat: 6.5193305, lng: 3.39858 },
+  "main library": { lat: 6.5197539, lng: 3.3997514 },
+  "unilag faculty of management sciences": { lat: 6.5203323, lng: 3.3994228 },
+  "guest house": { lat: 6.5214107, lng: 3.3988265 },
+  "guest house swimming pool": { lat: 6.5207177, lng: 3.4001204 },
+  "julius berger auditorium": { lat: 6.5191862, lng: 3.3990941 },
+  "unilag faculty of engineering": { lat: 6.5181429, lng: 3.399449 },
+  "unilag staff school": { lat: 6.5156902, lng: 3.3974618 },
+  "unilag medical centre": { lat: 6.5142832, lng: 3.3967445 },
+  "unilag faculty of social sciences": { lat: 6.5158223, lng: 3.3915972 },
+} satisfies Record<string, Coordinates>;
