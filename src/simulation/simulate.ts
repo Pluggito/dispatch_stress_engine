@@ -194,7 +194,7 @@ function createOrder(
   };
 }
 
-function debugDecisionTrace(order: Order, vendor: Vendor, decision: ReturnType<typeof dispatch>, selectedId: string | null): string {
+function debugDecisionTrace(order: Order, vendor: Vendor, decision: Awaited<ReturnType<typeof dispatch>>, selectedId: string | null): string {
   const candidates = decision.candidates
     .filter((candidate) => candidate.scored || candidate.reason)
     .sort((first, second) => {
@@ -251,9 +251,13 @@ export async function runSimulation(options: SimulationOptions = {}, routingEngi
   }));
   const fleet = createFleet(seed, options.trekkerCount, options.riderCount, options.riderCapacity);
   const deliveryMinutes: number[] = [];
+  const queueWaitMinutes: number[] = [];
   const pickupWaitMinutes: number[] = [];
   const pickupDelayMinutes: number[] = [];
   const queuedReasons: CurrentQueueFailureReason[] = [];
+  const occupancyIntervals: import("./metrics").OccupancyInterval[] = [];
+  let expiredOrders = 0;
+  let skippedRetryAttempts = 0;
   const pendingOrders: Order[] = [];
   const latestFailureByOrder = new Map<string, QueueFailureReason>();
   const pickupObservationByOrder = new Map<string, PickupQueueObservation>();
@@ -290,7 +294,7 @@ export async function runSimulation(options: SimulationOptions = {}, routingEngi
   let lastRetryAt = Number.NEGATIVE_INFINITY;
   const totalCapacity = fleet.reduce((capacity, person) => capacity + person.maxActiveDeliveries, 0);
 
-  function recordDecisionCounts(decision: ReturnType<typeof dispatch>) {
+  function recordDecisionCounts(decision: Awaited<ReturnType<typeof dispatch>>) {
     dispatchDecisions += 1;
     totalCandidateEvaluations += decision.totalCandidates - decision.candidatesRejectedBeforeRouting;
     candidatesRejectedBeforeRouting += decision.candidatesRejectedBeforeRouting;
@@ -380,6 +384,7 @@ export async function runSimulation(options: SimulationOptions = {}, routingEngi
     });
 
     deliveryMinutes.push(timeline.deliveryCompletedAt - timeline.orderCreatedAt);
+    queueWaitMinutes.push(Math.max(0, now - order.createdAt));
     pickupWaitMinutes.push(timeline.pickupWaitMinutes);
     pickupDelayMinutes.push(timeline.pickupDelayMinutes);
     if (timeline.pickupDelayMinutes > 0) latePickupCount += 1;
@@ -408,6 +413,11 @@ export async function runSimulation(options: SimulationOptions = {}, routingEngi
       expectedCompletionAt: timeline.deliveryCompletedAt,
       expectedLocation: order.customerLocation,
       latestDropoffAt: order.createdAt + maxDeliveryMinutes,
+    });
+    occupancyIntervals.push({
+      start: now,
+      end: timeline.deliveryCompletedAt,
+      type: selected.type,
     });
     latestFailureByOrder.delete(order.id);
     pickupObservationByOrder.delete(order.id);
@@ -509,14 +519,14 @@ export async function runSimulation(options: SimulationOptions = {}, routingEngi
     latePickupCount,
     slaMissedAssignments,
     queuedReasons,
+    expiredOrders,
+    skippedRetryAttempts,
+    occupancyIntervals,
+    queueWaitMinutes,
     pickupFeasibility,
     assignedPickupEtas,
     queuedPickupEtas,
     riderFailureEvents,
-    peakActiveAssignments,
-    peakActiveTrekkers,
-    peakActiveRiders,
-    utilizationSamples,
     assignedOrdersByPerson,
     riderIdleMinutes,
     currentWorkloadMinutes,

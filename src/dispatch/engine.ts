@@ -239,13 +239,106 @@ function classifyQueueFailure(candidates: CandidateEvaluation[]): QueueFailureRe
 }
 
 export async function dispatch(input: DispatchInput, strategy: DispatchStrategyName = "full"): Promise<DispatchDecision> {
-  const candidates = await Promise.all(input.deliveryPeople.map((person) => evaluateCandidate(input, person, strategy)));
+  // 1. True Greedy Nearest Strategy: sort by straight-line distance to vendor, evaluate sequentially, stop on first eligible!
+  if (strategy === "nearest" || strategy === "nearest-available") {
+    const onlineWithCapacity = input.deliveryPeople.filter(
+      (p) => p.status === "ONLINE" && p.maxActiveDeliveries > p.activeDeliveries.length
+    );
+
+    onlineWithCapacity.sort((a, b) => {
+      const aLoc = a.activeDeliveries.length > 0
+        ? a.activeDeliveries[a.activeDeliveries.length - 1].expectedLocation
+        : a.location;
+      const bLoc = b.activeDeliveries.length > 0
+        ? b.activeDeliveries[b.activeDeliveries.length - 1].expectedLocation
+        : b.location;
+      const aDist = Math.hypot(aLoc.latitude - input.vendor.location.latitude, aLoc.longitude - input.vendor.location.longitude);
+      const bDist = Math.hypot(bLoc.latitude - input.vendor.location.latitude, bLoc.longitude - input.vendor.location.longitude);
+      return aDist - bDist;
+    });
+
+    const evaluatedCandidates: CandidateEvaluation[] = [];
+    let selectedId: string | null = null;
+
+    for (const person of onlineWithCapacity) {
+      const candidate = await evaluateCandidate(input, person, strategy);
+      evaluatedCandidates.push(candidate);
+      if (candidate.eligible) {
+        selectedId = candidate.deliveryPersonId;
+        break; // Greedy stop on the closest eligible courier!
+      }
+    }
+
+    const unroutedCount = input.deliveryPeople.length - evaluatedCandidates.length;
+    const candidatesRejectedBeforeRouting = unroutedCount + evaluatedCandidates.filter((c) => !c.scored && c.reason !== "SLA_RISK" && c.reason !== "PICKUP_ETA_EXCEEDED").length;
+    const candidatesRejectedBeforeScoring = evaluatedCandidates.filter((c) => !c.scored).length;
+    const candidatesScored = evaluatedCandidates.filter((c) => c.scored).length;
+
+    return {
+      strategy,
+      selectedDeliveryPersonId: selectedId,
+      candidates: evaluatedCandidates,
+      totalCandidates: input.deliveryPeople.length,
+      candidatesRejectedBeforeRouting,
+      candidatesRejectedBeforeScoring,
+      candidatesScored,
+      queueReason: selectedId ? null : classifyQueueFailure(evaluatedCandidates),
+    };
+  }
+
+  // 2. Shortlist Strategy: pre-filter to top K candidates by proximity, then run full multi-objective evaluation
+  let evaluatedPeople = input.deliveryPeople;
+  let prefilteredCount = 0;
+
+  if (strategy.startsWith("shortlist-")) {
+    const onlineWithCapacity = input.deliveryPeople.filter(
+      (p) => p.status === "ONLINE" && p.maxActiveDeliveries > p.activeDeliveries.length
+    );
+
+    if (strategy.startsWith("shortlist-eta-")) {
+      const k = parseInt(strategy.replace("shortlist-eta-", ""), 10) || 5;
+      // Pre-filter: rank by courier availability (free time) + estimated straight-line travel to vendor
+      onlineWithCapacity.sort((a, b) => {
+        const aLoc = a.activeDeliveries.length > 0 ? a.activeDeliveries[a.activeDeliveries.length - 1].expectedLocation : a.location;
+        const bLoc = b.activeDeliveries.length > 0 ? b.activeDeliveries[b.activeDeliveries.length - 1].expectedLocation : b.location;
+        const aWorkload = Math.max(0, (latestCommitment(a)?.expectedCompletionAt ?? input.now) - input.now);
+        const bWorkload = Math.max(0, (latestCommitment(b)?.expectedCompletionAt ?? input.now) - input.now);
+        const aDistKm = Math.hypot((aLoc.latitude - input.vendor.location.latitude) * 111.0, (aLoc.longitude - input.vendor.location.longitude) * 110.0);
+        const bDistKm = Math.hypot((bLoc.latitude - input.vendor.location.latitude) * 111.0, (bLoc.longitude - input.vendor.location.longitude) * 110.0);
+        const aEta = aWorkload + (aDistKm / (a.type === "TREKKER" ? 5.0 : 22.0)) * 60.0;
+        const bEta = bWorkload + (bDistKm / (b.type === "TREKKER" ? 5.0 : 22.0)) * 60.0;
+        return aEta - bEta;
+      });
+      evaluatedPeople = onlineWithCapacity.slice(0, k);
+      prefilteredCount = input.deliveryPeople.length - evaluatedPeople.length;
+    } else {
+      const k = parseInt(strategy.replace("shortlist-", ""), 10) || 5;
+      // Coarse pre-filter: rank by straight-line Euclidean distance to vendor
+      onlineWithCapacity.sort((a, b) => {
+        const aLoc = a.activeDeliveries.length > 0
+          ? a.activeDeliveries[a.activeDeliveries.length - 1].expectedLocation
+          : a.location;
+        const bLoc = b.activeDeliveries.length > 0
+          ? b.activeDeliveries[b.activeDeliveries.length - 1].expectedLocation
+          : b.location;
+        const aDist = Math.hypot(aLoc.latitude - input.vendor.location.latitude, aLoc.longitude - input.vendor.location.longitude);
+        const bDist = Math.hypot(bLoc.latitude - input.vendor.location.latitude, bLoc.longitude - input.vendor.location.longitude);
+        return aDist - bDist;
+      });
+      evaluatedPeople = onlineWithCapacity.slice(0, k);
+      prefilteredCount = input.deliveryPeople.length - evaluatedPeople.length;
+    }
+  }
+
+  // 3. Full / Shortlist Evaluation
+  const effectiveStrategy: DispatchStrategyName = strategy.startsWith("shortlist-") ? "full" : strategy;
+  const candidates = await Promise.all(evaluatedPeople.map((person) => evaluateCandidate(input, person, effectiveStrategy)));
   candidates.sort((first, second) => {
     if (first.eligible !== second.eligible) return first.eligible ? -1 : 1;
     return (first.score ?? Number.POSITIVE_INFINITY) - (second.score ?? Number.POSITIVE_INFINITY);
   });
   const selectedDeliveryPersonId = candidates.find((candidate) => candidate.eligible)?.deliveryPersonId ?? null;
-  const candidatesRejectedBeforeRouting = candidates.filter((candidate) => candidate.reason === "NO_AVAILABLE_TREKKER" || candidate.reason === "NO_FEASIBLE_RIDER" || candidate.reason === "CAPACITY_FULL").length;
+  const candidatesRejectedBeforeRouting = prefilteredCount + candidates.filter((candidate) => candidate.reason === "NO_AVAILABLE_TREKKER" || candidate.reason === "NO_FEASIBLE_RIDER" || candidate.reason === "CAPACITY_FULL").length;
   const candidatesRejectedBeforeScoring = candidates.filter((candidate) => !candidate.scored).length;
   const candidatesScored = candidates.filter((candidate) => candidate.scored).length;
 
@@ -260,3 +353,5 @@ export async function dispatch(input: DispatchInput, strategy: DispatchStrategyN
     queueReason: selectedDeliveryPersonId ? null : classifyQueueFailure(candidates),
   };
 }
+
+

@@ -1,7 +1,7 @@
 import type { DeliveryPerson, Order, Vendor } from "../domain/types";
 import type { RoutingEngine } from "../routing/routing-engine";
 
-export type DispatchStrategyName = "nearest" | "nearest-available" | "earliest-arrival" | "ready-time-aware" | "full";
+export type DispatchStrategyName = "nearest" | "nearest-available" | "earliest-arrival" | "ready-time-aware" | "full" | "shortlist-3" | "shortlist-5" | "shortlist-8" | "shortlist-eta-3" | "shortlist-eta-5" | "shortlist-eta-8";
 
 export type QueueFailureReason =
   | "NO_AVAILABLE_TREKKER"

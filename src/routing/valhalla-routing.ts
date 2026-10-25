@@ -2,12 +2,43 @@ import type { Location } from "../domain/types";
 import type { RoutingEngine, RoutingContext, TravelEstimate, TravelMode } from "./routing-engine";
 import { HaversineRoutingEngine } from "./deterministic-routing";
 
+export type MatrixEstimate = {
+  fromIndex: number;
+  toIndex: number;
+  distanceKm: number;
+  durationMinutes: number;
+};
+
+export type IsochroneContour = {
+  timeMinutes: number;
+  color?: string;
+};
+
+export type IsochroneFeature = {
+  type: "Feature";
+  geometry: {
+    type: "Polygon" | "MultiPolygon";
+    coordinates: number[][][] | number[][][][];
+  };
+  properties: {
+    contour: number;
+    color?: string;
+    opacity?: number;
+  };
+};
+
+export type IsochroneResponse = {
+  type: "FeatureCollection";
+  features: IsochroneFeature[];
+};
+
 export class ValhallaRoutingEngine implements RoutingEngine {
   private cache = new Map<string, TravelEstimate>();
   private pendingRequests = new Map<string, Promise<TravelEstimate>>();
   private warnedErrors = new Set<string>();
   private haversineFallback = new HaversineRoutingEngine();
-  private endpoint = process.env.VALHALLA_URL || "http://localhost:8002/route";
+  
+  private baseUrl: string;
 
   public stats = {
     apiRequests: 0,
@@ -15,9 +46,21 @@ export class ValhallaRoutingEngine implements RoutingEngine {
     cacheMisses: 0,
     walkingRoutes: 0,
     drivingRoutes: 0,
+    matrixRequests: 0,
+    isochroneRequests: 0,
     routeFailures: 0,
     haversineFallbacks: 0,
   };
+
+  constructor(customUrl?: string) {
+    const raw = customUrl || process.env.VALHALLA_URL || "http://localhost:8002";
+    // Strip trailing /route or / if user passed full endpoint
+    this.baseUrl = raw.replace(/\/route\/?$/, "").replace(/\/+$/, "");
+  }
+
+  public getBaseUrl(): string {
+    return this.baseUrl;
+  }
 
   private getCacheKey(from: Location, to: Location, mode: TravelMode): string {
     const fromLat = from.latitude.toFixed(5);
@@ -27,6 +70,9 @@ export class ValhallaRoutingEngine implements RoutingEngine {
     return `${mode}:${fromLat},${fromLng}->${toLat},${toLng}`;
   }
 
+  /**
+   * /route: Single point-to-point trip calculation
+   */
   private async fetchFromValhalla(from: Location, to: Location, profile: string): Promise<TravelEstimate> {
     this.stats.apiRequests++;
 
@@ -39,7 +85,7 @@ export class ValhallaRoutingEngine implements RoutingEngine {
       units: "kilometers"
     };
 
-    const response = await fetch(this.endpoint, {
+    const response = await fetch(`${this.baseUrl}/route`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -63,6 +109,9 @@ export class ValhallaRoutingEngine implements RoutingEngine {
     return { distanceKm, durationMinutes };
   }
 
+  /**
+   * RoutingEngine standard interface: Estimate travel time between two points
+   */
   async estimateTravelTime(from: Location, to: Location, mode: TravelMode, context: RoutingContext = {}): Promise<TravelEstimate> {
     const isWalking = mode === "walking";
     const profile = isWalking ? "pedestrian" : "motorcycle";
@@ -76,14 +125,14 @@ export class ValhallaRoutingEngine implements RoutingEngine {
       return this.applyContext(this.cache.get(cacheKey)!, context);
     }
 
-    // Deduplicate concurrent requests
+    // Deduplicate concurrent requests for identical coordinates
     if (this.pendingRequests.has(cacheKey)) {
-      this.stats.cacheHits++; // Treat concurrent wait as hit
+      this.stats.cacheHits++;
       try {
         const result = await this.pendingRequests.get(cacheKey)!;
         return this.applyContext(result, context);
       } catch (e) {
-        // Fallback handles this below
+        // Handled by fallback below
       }
     } else {
       this.stats.cacheMisses++;
@@ -116,6 +165,83 @@ export class ValhallaRoutingEngine implements RoutingEngine {
 
       return fallback;
     }
+  }
+
+  /**
+   * /sources_to_targets: One-to-many or many-to-many distance/time matrix
+   * Perfect for "errands near worker" or "riders nearest to pickup" in a single HTTP roundtrip
+   */
+  async sourcesToTargets(
+    sources: Location[],
+    targets: Location[],
+    mode: TravelMode = "driving"
+  ): Promise<MatrixEstimate[][]> {
+    this.stats.matrixRequests++;
+    const profile = mode === "walking" ? "pedestrian" : "motorcycle";
+
+    const payload = {
+      sources: sources.map(s => ({ lat: s.latitude, lon: s.longitude })),
+      targets: targets.map(t => ({ lat: t.latitude, lon: t.longitude })),
+      costing: profile,
+      units: "kilometers"
+    };
+
+    const response = await fetch(`${this.baseUrl}/sources_to_targets`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+
+    if (!response.ok) {
+      throw new Error(`Valhalla matrix error: ${response.status} ${response.statusText}`);
+    }
+
+    const data = await response.json();
+    if (!data.sources_to_targets) {
+      throw new Error("No sources_to_targets returned by Valhalla matrix API");
+    }
+
+    return data.sources_to_targets.map((row: any[], srcIdx: number) =>
+      row.map((item: any, tgtIdx: number) => ({
+        fromIndex: srcIdx,
+        toIndex: tgtIdx,
+        distanceKm: item?.distance ?? 0,
+        durationMinutes: (item?.time ?? 0) / 60,
+      }))
+    );
+  }
+
+  /**
+   * /isochrone: Reachability polygon calculation
+   * Perfect for "show jobs within 15 or 30 minutes"
+   */
+  async isochrone(
+    center: Location,
+    contours: number[] = [15, 30],
+    mode: TravelMode = "driving"
+  ): Promise<IsochroneResponse> {
+    this.stats.isochroneRequests++;
+    const profile = mode === "walking" ? "pedestrian" : "motorcycle";
+
+    const payload = {
+      locations: [{ lat: center.latitude, lon: center.longitude }],
+      costing: profile,
+      contours: contours.map(time => ({ time })),
+      polygons: true,
+      units: "kilometers",
+    };
+
+    const response = await fetch(`${this.baseUrl}/isochrone`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+
+    if (!response.ok) {
+      throw new Error(`Valhalla isochrone error: ${response.status} ${response.statusText}`);
+    }
+
+    return response.json();
   }
 
   private applyContext(estimate: TravelEstimate, context: RoutingContext): TravelEstimate {
